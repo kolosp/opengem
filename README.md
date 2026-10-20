@@ -54,6 +54,8 @@ In OpenAI clients set `base_url=http://<lan-ip>:8000/v1` and use any dummy API k
 | `GEMINI_API_KEY` | required | Gemini API key |
 | `GEMINI_MODEL` | `gemini-2.5-flash` | Model used when the request has none |
 | `HOST` / `PORT` | `0.0.0.0` / `8000` | Bind address |
+| `RETRY_MAX_SECONDS` | `900` | How long to keep retrying transient upstream failures before returning the error |
+| `RETRY_EMPTY` | `3` | Retries when Gemini returns an empty reply |
 
 ## Run without Docker
 
@@ -61,6 +63,10 @@ In OpenAI clients set `base_url=http://<lan-ip>:8000/v1` and use any dummy API k
 pip install -r requirements.txt
 GEMINI_API_KEY=your_key python opengem.py
 ```
+
+## Retries
+
+Transient Gemini failures (503 high demand, 429, other 5xx, network errors, empty replies) are retried with backoff (1s growing to 20s) instead of being passed to the client, so multi-step agents don't lose progress. Streaming responses send SSE keepalive comments while waiting; non-streaming requests simply take longer, so set generous client timeouts. Retries only happen before any output is forwarded, so nothing is duplicated. Blocked (safety) and length-limited replies are not retried. Retry attempts are logged (`docker logs`).
 
 ## Limitations
 

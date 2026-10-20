@@ -8,6 +8,7 @@ Env:
   GEMINI_MODEL     default model if the client sends none (default gemini-2.5-flash)
   HOST / PORT      bind address (default 0.0.0.0:8000)
 """
+import asyncio
 import base64
 import json
 import os
@@ -24,6 +25,12 @@ from fastapi.responses import JSONResponse, StreamingResponse
 API_KEY = os.environ.get("GEMINI_API_KEY", "")
 DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 BASE = "https://generativelanguage.googleapis.com/v1beta"
+# Transient upstream failures (503 high demand, 429, 5xx, network errors, empty replies) are retried
+# with backoff so multi-step agents don't lose progress. Give up after RETRY_MAX_SECONDS.
+RETRY_MAX = float(os.environ.get("RETRY_MAX_SECONDS", "900"))
+RETRY_EMPTY = int(os.environ.get("RETRY_EMPTY", "3"))
+RETRY_STATUS = {408, 429, 500, 502, 503, 504}
+HDR = {"x-goog-api-key": API_KEY}
 
 app = FastAPI(title="opengem")
 # Browser clients (e.g. a web UI on :3000) send a CORS preflight for the Authorization header.
@@ -245,20 +252,14 @@ async def stream(model: str, req: dict, chat: bool) -> AsyncIterator[str]:
              "created": created, "model": model, "choices": choices, **(extra or {})}
         return f"data: {json.dumps(o)}\n\n"
 
-    url = f"{BASE}/models/{model}:streamGenerateContent?alt=sse"
     last_usage: dict = {}
-    async with client.stream("POST", url, json=req, headers={"x-goog-api-key": API_KEY}) as r:
-        if r.status_code != 200:
-            msg = (await r.aread()).decode(errors="replace")
-            yield f"data: {json.dumps({'error': {'message': msg, 'code': r.status_code}})}\n\n"
-            yield "data: [DONE]\n\n"
-            return
+    try:
         if chat:
             yield chunk([{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}])
-        async for line in r.aiter_lines():
-            if not line.startswith("data:"):
+        async for kind, d in gemini_stream(model, req):
+            if kind == "wait":
+                yield ": keepalive\n\n"
                 continue
-            d = json.loads(line[5:])
             if "usageMetadata" in d:
                 last_usage = usage(d)
             for i, c in enumerate(d.get("candidates", [])):
@@ -281,6 +282,10 @@ async def stream(model: str, req: dict, chat: bool) -> AsyncIterator[str]:
                     yield chunk([{"index": idx, "delta": delta, "finish_reason": fin}])
                 else:
                     yield chunk([{"index": idx, "text": text, "finish_reason": fin}])
+    except UpstreamError as e:
+        yield f"data: {json.dumps({'error': {'message': e.message, 'code': e.status}})}\n\n"
+        yield "data: [DONE]\n\n"
+        return
     yield chunk([], {"usage": last_usage} if last_usage else None)
     yield "data: [DONE]\n\n"
 
@@ -292,20 +297,113 @@ async def handle(body: dict, messages: list[dict], chat: bool):
         return error(400, "no usable message content", "invalid_request_error")
     if body.get("stream"):
         return StreamingResponse(stream(model, req, chat), media_type="text/event-stream")
-    r = await client.post(f"{BASE}/models/{model}:generateContent", json=req,
-                          headers={"x-goog-api-key": API_KEY})
-    if r.status_code != 200:
-        return upstream_error(r)
-    d = r.json()
+    try:
+        d = await gemini_call(model, req)
+    except UpstreamError as e:
+        return error(e.status, e.message)
     return JSONResponse((chat_response if chat else text_response)(d, model))
 
 
-def upstream_error(r: httpx.Response) -> JSONResponse:
+class UpstreamError(Exception):
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status, self.message = status, message
+
+
+def err_message(text: str) -> str:
     try:
-        msg = r.json()["error"]["message"]
+        return json.loads(text)["error"]["message"]
     except Exception:
-        msg = r.text
-    return error(r.status_code, msg)
+        return text
+
+
+def has_output(d: dict) -> bool:
+    return any(p.get("functionCall") or (p.get("text") and not p.get("thought"))
+               for c in d.get("candidates", []) for p in c.get("content", {}).get("parts", []))
+
+
+def final_empty(d: dict) -> bool:
+    """Empty because of a block/length limit: retrying would not help."""
+    return bool(d.get("promptFeedback", {}).get("blockReason")) or any(
+        c.get("finishReason") in ("MAX_TOKENS", *[k for k, v in FINISH.items() if v == "content_filter"])
+        for c in d.get("candidates", []))
+
+
+def log_retry(reason: str, wait: float) -> None:
+    print(f"[opengem] upstream {reason}, retrying in {wait:.0f}s", flush=True)
+
+
+async def gemini_call(model: str, req: dict) -> dict:
+    start, delay, empties = time.monotonic(), 1.0, 0
+    while True:
+        try:
+            r = await client.post(f"{BASE}/models/{model}:generateContent", json=req, headers=HDR)
+        except httpx.TransportError as e:
+            if time.monotonic() - start >= RETRY_MAX:
+                raise UpstreamError(502, f"upstream connection failed: {e!r}")
+            wait, reason = delay, type(e).__name__
+        else:
+            if r.status_code == 200:
+                d = r.json()
+                if has_output(d) or final_empty(d) or empties >= RETRY_EMPTY:
+                    return d
+                empties += 1
+                wait, reason = 1.0, "empty response"
+            elif r.status_code in RETRY_STATUS and time.monotonic() - start < RETRY_MAX:
+                wait, reason = delay, f"http {r.status_code}"
+            else:
+                raise UpstreamError(r.status_code, err_message(r.text))
+        log_retry(reason, wait)
+        await asyncio.sleep(wait)
+        delay = min(delay * 1.7, 20)
+
+
+async def gemini_stream(model: str, req: dict) -> AsyncIterator[tuple]:
+    """Yields ("data", chunk) and ("wait", None) keepalive ticks while retrying.
+    Retries only happen before any output was forwarded, so nothing is duplicated."""
+    start, delay, empties = time.monotonic(), 1.0, 0
+    url = f"{BASE}/models/{model}:streamGenerateContent?alt=sse"
+    while True:
+        wait, reason, got, held, blocked = 0.0, "", False, [], False
+        try:
+            async with client.stream("POST", url, json=req, headers=HDR) as r:
+                if r.status_code != 200:
+                    msg = err_message((await r.aread()).decode(errors="replace"))
+                    if r.status_code not in RETRY_STATUS or time.monotonic() - start >= RETRY_MAX:
+                        raise UpstreamError(r.status_code, msg)
+                    wait, reason = delay, f"http {r.status_code}"
+                else:
+                    async for line in r.aiter_lines():
+                        if not line.startswith("data:"):
+                            continue
+                        d = json.loads(line[5:])
+                        blocked = blocked or final_empty(d)
+                        got = got or has_output(d)
+                        if got:
+                            for h in held:
+                                yield ("data", h)
+                            held = []
+                            yield ("data", d)
+                        else:
+                            held.append(d)  # metadata-only chunks: hold until real output shows up
+                    if got:
+                        return
+                    if blocked or empties >= RETRY_EMPTY:
+                        for h in held:
+                            yield ("data", h)
+                        return
+                    empties += 1
+                    wait, reason = 1.0, "empty response"
+        except httpx.TransportError as e:
+            if got or time.monotonic() - start >= RETRY_MAX:
+                raise UpstreamError(502, f"upstream connection failed: {e!r}")
+            wait, reason = delay, type(e).__name__
+        log_retry(reason, wait)
+        end = time.monotonic() + wait
+        while time.monotonic() < end:
+            yield ("wait", None)
+            await asyncio.sleep(min(5, max(0.0, end - time.monotonic())))
+        delay = min(delay * 1.7, 20)
 
 
 # ---------- routes ----------
@@ -428,16 +526,11 @@ async def responses_stream(model: str, req: dict) -> AsyncIterator[str]:
 
     yield ev("response.created", response=resp_obj(rid, model, created, "in_progress", []))
     yield ev("response.in_progress", response=resp_obj(rid, model, created, "in_progress", []))
-    async with client.stream("POST", f"{BASE}/models/{model}:streamGenerateContent?alt=sse",
-                             json=req, headers={"x-goog-api-key": API_KEY}) as r:
-        if r.status_code != 200:
-            err = (await r.aread()).decode(errors="replace")
-            yield ev("error", code=str(r.status_code), message=err, param=None)
-            return
-        async for line in r.aiter_lines():
-            if not line.startswith("data:"):
+    try:
+        async for kind, d in gemini_stream(model, req):
+            if kind == "wait":
+                yield ": keepalive\n\n"
                 continue
-            d = json.loads(line[5:])
             if "usageMetadata" in d:
                 u = usage(d)
             for c in d.get("candidates", [])[:1]:
@@ -452,6 +545,9 @@ async def responses_stream(model: str, req: dict) -> AsyncIterator[str]:
                     else:
                         for e in end_msg() + call_events(it[1], it[2], it[3]):
                             yield e
+    except UpstreamError as e:
+        yield ev("error", code=str(e.status), message=e.message, param=None)
+        return
     for e in end_msg():
         yield e
     yield ev("response.completed", response=resp_obj(rid, model, created, "completed", output, u))
@@ -466,11 +562,10 @@ async def responses(request: Request):
         return error(400, "no usable input", "invalid_request_error")
     if body.get("stream"):
         return StreamingResponse(responses_stream(model, req), media_type="text/event-stream")
-    r = await client.post(f"{BASE}/models/{model}:generateContent", json=req,
-                          headers={"x-goog-api-key": API_KEY})
-    if r.status_code != 200:
-        return upstream_error(r)
-    d = r.json()
+    try:
+        d = await gemini_call(model, req)
+    except UpstreamError as e:
+        return error(e.status, e.message)
     cands = d.get("candidates", [])[:1]
     return JSONResponse(resp_obj(f"resp_{uuid.uuid4().hex}", model, int(time.time()), "completed",
                                  responses_output(cand_items(cands[0]) if cands else []), usage(d)))
