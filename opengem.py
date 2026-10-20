@@ -1,6 +1,7 @@
 """OpenAI-compatible proxy for Google Gemini. No auth: for private LAN use only.
 
-Endpoints: POST /v1/chat/completions, POST /v1/completions, GET /v1/models
+Endpoints: POST /v1/chat/completions, /v1/completions, /v1/responses; GET /v1/models
+Function calling is supported on chat completions and responses.
 
 Env:
   GEMINI_API_KEY   required
@@ -33,6 +34,12 @@ FINISH = {"STOP": "stop", "MAX_TOKENS": "length", "SAFETY": "content_filter",
           "RECITATION": "content_filter", "BLOCKLIST": "content_filter",
           "PROHIBITED_CONTENT": "content_filter", "SPII": "content_filter"}
 
+# Gemini 3 requires the thoughtSignature of a function call to be echoed back with the history.
+# Clients only echo OpenAI fields, so remember signatures by call id (bounded) and fall back to
+# Google's documented bypass value for unknown calls.
+SIGS: dict[str, str] = {}
+DUMMY_SIG = "skip_thought_signature_validator"
+
 
 def error(status: int, message: str, typ: str = "api_error") -> JSONResponse:
     return JSONResponse({"error": {"message": message, "type": typ, "code": status}}, status_code=status)
@@ -44,13 +51,15 @@ def to_parts(content: Any) -> list[dict]:
     if content is None:
         return []
     if isinstance(content, str):
-        return [{"text": content}]
+        return [{"text": content}] if content else []
     parts = []
     for p in content:
-        if p.get("type") == "text":
+        t = p.get("type")
+        if t in ("text", "input_text", "output_text"):
             parts.append({"text": p["text"]})
-        elif p.get("type") == "image_url":
-            url = p["image_url"]["url"]
+        elif t in ("image_url", "input_image"):
+            u = p.get("image_url")
+            url = u["url"] if isinstance(u, dict) else u
             if url.startswith("data:"):
                 meta, data = url[5:].split(",", 1)
                 mime = meta.split(";")[0]
@@ -62,17 +71,73 @@ def to_parts(content: Any) -> list[dict]:
     return parts
 
 
+def text_of(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(p.get("text", "") for p in content if isinstance(p, dict))
+    return "" if content is None else json.dumps(content)
+
+
+def gemini_tools(body: dict) -> dict:
+    """OpenAI tools (chat nested or responses flat shape) -> Gemini tools/toolConfig."""
+    decls = []
+    for t in body.get("tools") or []:
+        if t.get("type") != "function":
+            continue  # web_search, custom, etc. are not supported
+        f = t.get("function", t)
+        d: dict[str, Any] = {"name": f["name"]}
+        if f.get("description"):
+            d["description"] = f["description"]
+        if f.get("parameters"):
+            d["parametersJsonSchema"] = f["parameters"]
+        decls.append(d)
+    if not decls:
+        return {}
+    out: dict[str, Any] = {"tools": [{"functionDeclarations": decls}]}
+    tc, cfg = body.get("tool_choice"), None
+    if tc == "none":
+        cfg = {"mode": "NONE"}
+    elif tc == "required":
+        cfg = {"mode": "ANY"}
+    elif isinstance(tc, dict):
+        name = tc.get("name") or (tc.get("function") or {}).get("name")
+        if name:
+            cfg = {"mode": "ANY", "allowedFunctionNames": [name]}
+    if cfg:
+        out["toolConfig"] = {"functionCallingConfig": cfg}
+    return out
+
+
 def build_request(body: dict, messages: list[dict]) -> dict:
-    system, contents = [], []
+    system, contents, names = [], [], {}
     for m in messages:
         role = m.get("role")
         if role in ("system", "developer"):
             system += to_parts(m.get("content"))
             continue
-        parts = to_parts(m.get("content"))
+        if role == "tool":
+            name = names.get(m.get("tool_call_id")) or m.get("name") or "tool"
+            parts = [{"functionResponse": {"name": name,
+                                           "response": {"output": text_of(m.get("content"))}}}]
+            g_role = "user"
+        else:
+            parts = to_parts(m.get("content"))
+            for tc in m.get("tool_calls") or []:
+                f = tc["function"]
+                names[tc["id"]] = f["name"]
+                try:
+                    args = json.loads(f.get("arguments") or "{}")
+                except ValueError:
+                    args = {}
+                part: dict[str, Any] = {"functionCall": {"name": f["name"], "args": args}}
+                sig = SIGS.get(tc["id"]) or (DUMMY_SIG if not any("functionCall" in p for p in parts) else None)
+                if sig:
+                    part["thoughtSignature"] = sig
+                parts.append(part)
+            g_role = "model" if role == "assistant" else "user"
         if not parts:
             continue
-        g_role = "model" if role == "assistant" else "user"
         if contents and contents[-1]["role"] == g_role:  # Gemini wants alternating roles
             contents[-1]["parts"] += parts
         else:
@@ -98,7 +163,7 @@ def build_request(body: dict, messages: list[dict]) -> dict:
         if schema:
             cfg["responseJsonSchema"] = schema
 
-    req: dict[str, Any] = {"contents": contents, "generationConfig": cfg}
+    req: dict[str, Any] = {"contents": contents, "generationConfig": cfg, **gemini_tools(body)}
     if system:
         req["systemInstruction"] = {"parts": system}
     return req
@@ -106,8 +171,25 @@ def build_request(body: dict, messages: list[dict]) -> dict:
 
 # ---------- Gemini -> OpenAI ----------
 
+def cand_items(c: dict) -> list[tuple]:
+    """Candidate parts -> [("text", str)] / [("call", call_id, name, args)] in order."""
+    items: list[tuple] = []
+    for p in c.get("content", {}).get("parts", []):
+        if "functionCall" in p:
+            fc = p["functionCall"]
+            cid = f"call_{uuid.uuid4().hex[:24]}"
+            if p.get("thoughtSignature"):
+                SIGS[cid] = p["thoughtSignature"]
+                while len(SIGS) > 2000:
+                    SIGS.pop(next(iter(SIGS)))
+            items.append(("call", cid, fc["name"], fc.get("args") or {}))
+        elif p.get("text") and not p.get("thought"):
+            items.append(("text", p["text"]))
+    return items
+
+
 def cand_text(c: dict) -> str:
-    return "".join(p.get("text", "") for p in c.get("content", {}).get("parts", []) if not p.get("thought"))
+    return "".join(i[1] for i in cand_items(c) if i[0] == "text")
 
 
 def usage(d: dict) -> dict:
@@ -117,18 +199,31 @@ def usage(d: dict) -> dict:
             "total_tokens": u.get("totalTokenCount", 0)}
 
 
-def finish(c: dict) -> str | None:
+def finish(c: dict, calls: bool = False) -> str | None:
     r = c.get("finishReason")
-    return FINISH.get(r, "stop") if r else None
+    if not r:
+        return None
+    return "tool_calls" if calls else FINISH.get(r, "stop")
+
+
+def oa_call(cid: str, name: str, args: dict, index: int | None = None) -> dict:
+    o = {"id": cid, "type": "function", "function": {"name": name, "arguments": json.dumps(args)}}
+    if index is not None:
+        o["index"] = index
+    return o
 
 
 def chat_response(d: dict, model: str) -> dict:
+    choices = []
+    for i, c in enumerate(d.get("candidates", [])):
+        items = cand_items(c)
+        calls = [oa_call(*it[1:]) for it in items if it[0] == "call"]
+        msg: dict[str, Any] = {"role": "assistant", "content": "".join(it[1] for it in items if it[0] == "text") or None}
+        if calls:
+            msg["tool_calls"] = calls
+        choices.append({"index": i, "message": msg, "finish_reason": finish(c, bool(calls)) or "stop"})
     return {"id": f"chatcmpl-{uuid.uuid4().hex}", "object": "chat.completion",
-            "created": int(time.time()), "model": model,
-            "choices": [{"index": i, "message": {"role": "assistant", "content": cand_text(c)},
-                         "finish_reason": finish(c) or "stop"}
-                        for i, c in enumerate(d.get("candidates", []))],
-            "usage": usage(d)}
+            "created": int(time.time()), "model": model, "choices": choices, "usage": usage(d)}
 
 
 def text_response(d: dict, model: str) -> dict:
@@ -143,17 +238,12 @@ def text_response(d: dict, model: str) -> dict:
 async def stream(model: str, req: dict, chat: bool) -> AsyncIterator[str]:
     cid = f"{'chatcmpl' if chat else 'cmpl'}-{uuid.uuid4().hex}"
     created = int(time.time())
+    ncalls: dict[int, int] = {}  # tool call count per choice
 
     def chunk(choices: list, extra: dict | None = None) -> str:
         o = {"id": cid, "object": "chat.completion.chunk" if chat else "text_completion",
              "created": created, "model": model, "choices": choices, **(extra or {})}
         return f"data: {json.dumps(o)}\n\n"
-
-    def choice(i: int, text: str | None, fin: str | None) -> dict:
-        if chat:
-            delta = {"content": text} if text else {}
-            return {"index": i, "delta": delta, "finish_reason": fin}
-        return {"index": i, "text": text or "", "finish_reason": fin}
 
     url = f"{BASE}/models/{model}:streamGenerateContent?alt=sse"
     last_usage: dict = {}
@@ -172,9 +262,25 @@ async def stream(model: str, req: dict, chat: bool) -> AsyncIterator[str]:
             if "usageMetadata" in d:
                 last_usage = usage(d)
             for i, c in enumerate(d.get("candidates", [])):
-                t, f = cand_text(c), finish(c)
-                if t or f:
-                    yield chunk([choice(c.get("index", i), t, f)])
+                idx = c.get("index", i)
+                text, calls = "", []
+                for it in cand_items(c):
+                    if it[0] == "text":
+                        text += it[1]
+                    else:
+                        n = ncalls.get(idx, 0)
+                        ncalls[idx] = n + 1
+                        calls.append(oa_call(*it[1:], index=n))
+                fin = finish(c, ncalls.get(idx, 0) > 0)
+                if not (text or calls or fin):
+                    continue
+                if chat:
+                    delta: dict[str, Any] = {"content": text} if text else {}
+                    if calls:
+                        delta["tool_calls"] = calls
+                    yield chunk([{"index": idx, "delta": delta, "finish_reason": fin}])
+                else:
+                    yield chunk([{"index": idx, "text": text, "finish_reason": fin}])
     yield chunk([], {"usage": last_usage} if last_usage else None)
     yield "data: [DONE]\n\n"
 
@@ -189,13 +295,17 @@ async def handle(body: dict, messages: list[dict], chat: bool):
     r = await client.post(f"{BASE}/models/{model}:generateContent", json=req,
                           headers={"x-goog-api-key": API_KEY})
     if r.status_code != 200:
-        try:
-            msg = r.json()["error"]["message"]
-        except Exception:
-            msg = r.text
-        return error(r.status_code, msg)
+        return upstream_error(r)
     d = r.json()
     return JSONResponse((chat_response if chat else text_response)(d, model))
+
+
+def upstream_error(r: httpx.Response) -> JSONResponse:
+    try:
+        msg = r.json()["error"]["message"]
+    except Exception:
+        msg = r.text
+    return error(r.status_code, msg)
 
 
 # ---------- routes ----------
@@ -218,6 +328,7 @@ async def completions(request: Request):
 # ---------- Responses API (/v1/responses) ----------
 
 def responses_messages(body: dict) -> list[dict]:
+    """Responses `input` items -> chat-style messages (incl. assistant tool_calls / tool results)."""
     msgs = []
     if body.get("instructions"):
         msgs.append({"role": "system", "content": body["instructions"]})
@@ -225,28 +336,20 @@ def responses_messages(body: dict) -> list[dict]:
     if isinstance(inp, str):
         return msgs + [{"role": "user", "content": inp}]
     for item in inp:
-        if item.get("type", "message") != "message":
-            continue  # function_call / reasoning items etc. are not supported
-        c = item.get("content")
-        if isinstance(c, list):
-            parts = []
-            for p in c:
-                if p.get("type") in ("input_text", "output_text", "text"):
-                    parts.append({"type": "text", "text": p["text"]})
-                elif p.get("type") == "input_image":
-                    u = p.get("image_url")
-                    parts.append({"type": "image_url", "image_url": {"url": u["url"] if isinstance(u, dict) else u}})
-            c = parts
-        msgs.append({"role": item.get("role", "user"), "content": c})
+        t = item.get("type", "message")
+        if t == "message":
+            msgs.append({"role": item.get("role", "user"), "content": item.get("content")})
+        elif t == "function_call":
+            msgs.append({"role": "assistant", "content": None, "tool_calls": [
+                {"id": item["call_id"], "type": "function",
+                 "function": {"name": item["name"], "arguments": item.get("arguments") or "{}"}}]})
+        elif t == "function_call_output":
+            msgs.append({"role": "tool", "tool_call_id": item["call_id"], "content": item.get("output")})
+        # reasoning items and other types are dropped
     return msgs
 
 
-def resp_obj(rid: str, model: str, created: int, status: str, text: str = "", u: dict | None = None,
-             mid: str = "") -> dict:
-    output = []
-    if status == "completed":
-        output = [{"type": "message", "id": mid, "status": "completed", "role": "assistant",
-                   "content": [{"type": "output_text", "text": text, "annotations": []}]}]
+def resp_obj(rid: str, model: str, created: int, status: str, output: list, u: dict | None = None) -> dict:
     o: dict[str, Any] = {"id": rid, "object": "response", "created_at": created, "status": status,
                          "model": model, "output": output}
     if u:
@@ -255,27 +358,81 @@ def resp_obj(rid: str, model: str, created: int, status: str, text: str = "", u:
     return o
 
 
+def msg_item(mid: str, text: str, status: str = "completed") -> dict:
+    return {"type": "message", "id": mid, "status": status, "role": "assistant",
+            "content": [{"type": "output_text", "text": text, "annotations": []}] if status == "completed" else []}
+
+
+def call_item(fid: str, cid: str, name: str, args: str, status: str = "completed") -> dict:
+    return {"type": "function_call", "id": fid, "call_id": cid, "name": name,
+            "arguments": args, "status": status}
+
+
+def responses_output(items: list[tuple]) -> list[dict]:
+    out, text = [], ""
+    for it in items:
+        if it[0] == "text":
+            text += it[1]
+        else:
+            if text:
+                out.append(msg_item(f"msg_{uuid.uuid4().hex}", text))
+                text = ""
+            out.append(call_item(f"fc_{uuid.uuid4().hex}", it[1], it[2], json.dumps(it[3])))
+    if text:
+        out.append(msg_item(f"msg_{uuid.uuid4().hex}", text))
+    return out
+
+
 async def responses_stream(model: str, req: dict) -> AsyncIterator[str]:
-    rid, mid, created = f"resp_{uuid.uuid4().hex}", f"msg_{uuid.uuid4().hex}", int(time.time())
+    rid, created = f"resp_{uuid.uuid4().hex}", int(time.time())
     seq = 0
+    output: list[Any] = []
+    msg: dict | None = None  # currently open message: {id, idx, text}
+    u: dict = {}
 
     def ev(t: str, **kw) -> str:
         nonlocal seq
         seq += 1
         return f"event: {t}\ndata: {json.dumps({'type': t, 'sequence_number': seq, **kw})}\n\n"
 
-    yield ev("response.created", response=resp_obj(rid, model, created, "in_progress"))
-    yield ev("response.in_progress", response=resp_obj(rid, model, created, "in_progress"))
-    yield ev("response.output_item.added", output_index=0,
-             item={"id": mid, "type": "message", "status": "in_progress", "role": "assistant", "content": []})
-    yield ev("response.content_part.added", item_id=mid, output_index=0, content_index=0,
-             part={"type": "output_text", "text": "", "annotations": []})
-    full, u = "", {}
+    def start_msg() -> list[str]:
+        nonlocal msg
+        msg = {"id": f"msg_{uuid.uuid4().hex}", "idx": len(output), "text": ""}
+        output.append(None)
+        return [ev("response.output_item.added", output_index=msg["idx"],
+                   item=msg_item(msg["id"], "", "in_progress")),
+                ev("response.content_part.added", item_id=msg["id"], output_index=msg["idx"],
+                   content_index=0, part={"type": "output_text", "text": "", "annotations": []})]
+
+    def end_msg() -> list[str]:
+        nonlocal msg
+        if not msg:
+            return []
+        m, msg = msg, None
+        item = msg_item(m["id"], m["text"])
+        output[m["idx"]] = item
+        return [ev("response.output_text.done", item_id=m["id"], output_index=m["idx"],
+                   content_index=0, text=m["text"]),
+                ev("response.content_part.done", item_id=m["id"], output_index=m["idx"],
+                   content_index=0, part=item["content"][0]),
+                ev("response.output_item.done", output_index=m["idx"], item=item)]
+
+    def call_events(cid: str, name: str, args: dict) -> list[str]:
+        idx, fid, a = len(output), f"fc_{uuid.uuid4().hex}", json.dumps(args)
+        item = call_item(fid, cid, name, a)
+        output.append(item)
+        return [ev("response.output_item.added", output_index=idx, item={**item, "arguments": "", "status": "in_progress"}),
+                ev("response.function_call_arguments.delta", item_id=fid, output_index=idx, delta=a),
+                ev("response.function_call_arguments.done", item_id=fid, output_index=idx, name=name, arguments=a),
+                ev("response.output_item.done", output_index=idx, item=item)]
+
+    yield ev("response.created", response=resp_obj(rid, model, created, "in_progress", []))
+    yield ev("response.in_progress", response=resp_obj(rid, model, created, "in_progress", []))
     async with client.stream("POST", f"{BASE}/models/{model}:streamGenerateContent?alt=sse",
                              json=req, headers={"x-goog-api-key": API_KEY}) as r:
         if r.status_code != 200:
-            msg = (await r.aread()).decode(errors="replace")
-            yield ev("error", code=str(r.status_code), message=msg, param=None)
+            err = (await r.aread()).decode(errors="replace")
+            yield ev("error", code=str(r.status_code), message=err, param=None)
             return
         async for line in r.aiter_lines():
             if not line.startswith("data:"):
@@ -283,26 +440,28 @@ async def responses_stream(model: str, req: dict) -> AsyncIterator[str]:
             d = json.loads(line[5:])
             if "usageMetadata" in d:
                 u = usage(d)
-            for c in d.get("candidates", []):
-                t = cand_text(c)
-                if t:
-                    full += t
-                    yield ev("response.output_text.delta", item_id=mid, output_index=0,
-                             content_index=0, delta=t)
-    yield ev("response.output_text.done", item_id=mid, output_index=0, content_index=0, text=full)
-    yield ev("response.content_part.done", item_id=mid, output_index=0, content_index=0,
-             part={"type": "output_text", "text": full, "annotations": []})
-    done = resp_obj(rid, model, created, "completed", full, u, mid)
-    yield ev("response.output_item.done", output_index=0, item=done["output"][0])
-    yield ev("response.completed", response=done)
+            for c in d.get("candidates", [])[:1]:
+                for it in cand_items(c):
+                    if it[0] == "text":
+                        if not msg:
+                            for e in start_msg():
+                                yield e
+                        msg["text"] += it[1]
+                        yield ev("response.output_text.delta", item_id=msg["id"], output_index=msg["idx"],
+                                 content_index=0, delta=it[1])
+                    else:
+                        for e in end_msg() + call_events(it[1], it[2], it[3]):
+                            yield e
+    for e in end_msg():
+        yield e
+    yield ev("response.completed", response=resp_obj(rid, model, created, "completed", output, u))
 
 
 @app.post("/v1/responses")
 async def responses(request: Request):
     body = await request.json()
     model = (body.get("model") or DEFAULT_MODEL).removeprefix("models/")
-    chat_body = {**body, "max_tokens": body.get("max_output_tokens")}
-    req = build_request(chat_body, responses_messages(body))
+    req = build_request({**body, "max_tokens": body.get("max_output_tokens")}, responses_messages(body))
     if not req["contents"]:
         return error(400, "no usable input", "invalid_request_error")
     if body.get("stream"):
@@ -310,15 +469,11 @@ async def responses(request: Request):
     r = await client.post(f"{BASE}/models/{model}:generateContent", json=req,
                           headers={"x-goog-api-key": API_KEY})
     if r.status_code != 200:
-        try:
-            msg = r.json()["error"]["message"]
-        except Exception:
-            msg = r.text
-        return error(r.status_code, msg)
+        return upstream_error(r)
     d = r.json()
-    text = "".join(cand_text(c) for c in d.get("candidates", [])[:1])
+    cands = d.get("candidates", [])[:1]
     return JSONResponse(resp_obj(f"resp_{uuid.uuid4().hex}", model, int(time.time()), "completed",
-                                 text, usage(d), f"msg_{uuid.uuid4().hex}"))
+                                 responses_output(cand_items(cands[0]) if cands else []), usage(d)))
 
 
 @app.get("/v1/models")

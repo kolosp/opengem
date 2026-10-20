@@ -64,4 +64,4 @@ GEMINI_API_KEY=your_key python opengem.py
 
 ## Limitations
 
-No tool/function calling, embeddings or logprobs. Anyone who can reach the port can spend your Gemini quota, so keep it on the LAN.
+Function calling works on chat completions and responses (non-function tools such as web search are ignored, `previous_response_id` is not supported). No embeddings or logprobs. Anyone who can reach the port can spend your Gemini quota, so keep it on the LAN.
