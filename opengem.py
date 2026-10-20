@@ -6,6 +6,8 @@ Function calling is supported on chat completions and responses.
 Env:
   GEMINI_API_KEY   required
   GEMINI_MODEL     default model if the client sends none (default gemini-3.5-flash-lite)
+  GEMINI_THINKING  minimal|low|medium|high = force this thinking level on every request
+  GEMINI_POOL      cheap | model1,model2,... = on 429/503 fail over across these models
   GEMINI_FORCE_MODEL  1 = always use GEMINI_MODEL, ignoring the client's model
   HOST / PORT      bind address (default 0.0.0.0:8000)
 """
@@ -26,6 +28,18 @@ from fastapi.responses import JSONResponse, StreamingResponse
 API_KEY = os.environ.get("GEMINI_API_KEY", "")
 DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
 # When set, always use DEFAULT_MODEL and ignore the model the client asks for.
+# When set (minimal|low|medium|high), force this thinking level on every request.
+THINKING = os.environ.get("GEMINI_THINKING", "").strip().lower()
+if THINKING not in ("", "minimal", "low", "medium", "high"):
+    raise SystemExit("GEMINI_THINKING must be minimal, low, medium or high")
+# Gemini 2.5 takes a token budget instead of a level.
+BUDGETS = {"minimal": 0, "low": 1024, "medium": 8192, "high": 24576}
+# Failover pool: on 429/503 switch to the next model instead of waiting on the same one.
+# GEMINI_POOL = "cheap" (built-in list) or a comma-separated list of model ids; unset = off.
+CHEAP_POOL = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-flash-lite-latest"]
+_pool = os.environ.get("GEMINI_POOL", "").strip()
+POOL = CHEAP_POOL if _pool.lower() == "cheap" else [m.strip().removeprefix("models/") for m in _pool.split(",") if m.strip()]
+POOL_STATUS = {429, 503}
 FORCE_MODEL = os.environ.get("GEMINI_FORCE_MODEL", "").lower() in ("1", "true", "yes", "on")
 BASE = "https://generativelanguage.googleapis.com/v1beta"
 # Transient upstream failures (503 high demand, 429, 5xx, network errors, empty replies) are retried
@@ -301,6 +315,34 @@ def pick_model(body: dict) -> str:
     return model
 
 
+def with_thinking(req: dict, model: str) -> dict:
+    """The request for this model, with the forced thinking level applied (if any)."""
+    if not THINKING:
+        return req
+    tc = {"thinkingBudget": BUDGETS[THINKING]} if model.startswith("gemini-2.5") else {"thinkingLevel": THINKING}
+    return {**req, "generationConfig": {**req["generationConfig"], "thinkingConfig": tc}}
+
+
+class Rotor:
+    """Walks the failover pool, starting at the requested model."""
+    def __init__(self, model: str):
+        self.models = [model] + [m for m in POOL if m != model]
+        self.i = 0
+
+    @property
+    def model(self) -> str:
+        return self.models[self.i]
+
+    def next(self, reason: str) -> bool:
+        """Switch to the next model. True once every model has failed (a full cycle)."""
+        if len(self.models) == 1:
+            return True
+        old = self.model
+        self.i = (self.i + 1) % len(self.models)
+        print(f"[opengem] {old} {reason}, failing over to {self.model}", flush=True)
+        return self.i == 0
+
+
 async def handle(body: dict, messages: list[dict], chat: bool):
     model = pick_model(body)
     req = build_request(body, messages)
@@ -345,10 +387,11 @@ def log_retry(reason: str, wait: float) -> None:
 
 
 async def gemini_call(model: str, req: dict) -> dict:
-    start, delay, empties = time.monotonic(), 1.0, 0
+    start, delay, empties, rot = time.monotonic(), 1.0, 0, Rotor(model)
     while True:
         try:
-            r = await client.post(f"{BASE}/models/{model}:generateContent", json=req, headers=HDR)
+            r = await client.post(f"{BASE}/models/{rot.model}:generateContent",
+                                  json=with_thinking(req, rot.model), headers=HDR)
         except httpx.TransportError as e:
             if time.monotonic() - start >= RETRY_MAX:
                 raise UpstreamError(502, f"upstream connection failed: {e!r}")
@@ -362,6 +405,8 @@ async def gemini_call(model: str, req: dict) -> dict:
                 wait, reason = 1.0, "empty response"
             elif r.status_code in RETRY_STATUS and time.monotonic() - start < RETRY_MAX:
                 wait, reason = delay, f"http {r.status_code}"
+                if r.status_code in POOL_STATUS and not rot.next(reason):
+                    continue  # untried pool models left: switch now, no backoff
             else:
                 raise UpstreamError(r.status_code, err_message(r.text))
         log_retry(reason, wait)
@@ -372,17 +417,19 @@ async def gemini_call(model: str, req: dict) -> dict:
 async def gemini_stream(model: str, req: dict) -> AsyncIterator[tuple]:
     """Yields ("data", chunk) and ("wait", None) keepalive ticks while retrying.
     Retries only happen before any output was forwarded, so nothing is duplicated."""
-    start, delay, empties = time.monotonic(), 1.0, 0
-    url = f"{BASE}/models/{model}:streamGenerateContent?alt=sse"
+    start, delay, empties, rot = time.monotonic(), 1.0, 0, Rotor(model)
     while True:
         wait, reason, got, held, blocked = 0.0, "", False, [], False
+        url = f"{BASE}/models/{rot.model}:streamGenerateContent?alt=sse"
         try:
-            async with client.stream("POST", url, json=req, headers=HDR) as r:
+            async with client.stream("POST", url, json=with_thinking(req, rot.model), headers=HDR) as r:
                 if r.status_code != 200:
                     msg = err_message((await r.aread()).decode(errors="replace"))
                     if r.status_code not in RETRY_STATUS or time.monotonic() - start >= RETRY_MAX:
                         raise UpstreamError(r.status_code, msg)
                     wait, reason = delay, f"http {r.status_code}"
+                    if r.status_code in POOL_STATUS and not rot.next(reason):
+                        continue  # untried pool models left: switch now, no backoff
                 else:
                     async for line in r.aiter_lines():
                         if not line.startswith("data:"):
