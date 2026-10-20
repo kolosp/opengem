@@ -6,7 +6,7 @@ Endpoints: `POST /v1/chat/completions`, `POST /v1/completions`, `GET /v1/models`
 
 ## Run the ghcr image
 
-Images are built and pushed by CI on every push to `main` (tags: `latest`, `sha-<short>`, and `X.Y.Z` for `v*` tags).
+Images are multi-arch (`linux/amd64`, `linux/arm64` — the latter runs natively on Apple Silicon Macs) and are built and pushed by CI on every push to `main` (tags: `latest`, `sha-<short>`, and `X.Y.Z` for `v*` tags).
 
 ```bash
 docker run -d --name opengem --restart unless-stopped \
