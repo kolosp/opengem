@@ -36,7 +36,7 @@ if THINKING not in ("", "minimal", "low", "medium", "high"):
 BUDGETS = {"minimal": 0, "low": 1024, "medium": 8192, "high": 24576}
 # Failover pool: on 429/503 switch to the next model instead of waiting on the same one.
 # GEMINI_POOL = "cheap" (built-in list) or a comma-separated list of model ids; unset = off.
-CHEAP_POOL = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-flash-lite-latest"]
+CHEAP_POOL = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
 _pool = os.environ.get("GEMINI_POOL", "").strip()
 POOL = CHEAP_POOL if _pool.lower() == "cheap" else [m.strip().removeprefix("models/") for m in _pool.split(",") if m.strip()]
 POOL_STATUS = {429, 503}

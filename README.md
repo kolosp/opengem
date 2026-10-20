@@ -60,7 +60,7 @@ See [MODELS.md](MODELS.md) for the available model ids.
 | `GEMINI_MODEL` | `gemini-3.5-flash-lite` | Model used when the request has none |
 | `GEMINI_FORCE_MODEL` | off | `1`/`true` = always use `GEMINI_MODEL`, ignoring the model the client sends |
 | `GEMINI_THINKING` | unset | `minimal`/`low`/`medium`/`high`: force this thinking level on every request (Gemini 2.5 models get an equivalent token budget). Unset = Gemini's own default |
-| `GEMINI_POOL` | unset | Failover pool. On 429/503 the request moves to the next model immediately instead of waiting on the same one. `cheap` = `gemini-3.5-flash-lite`, `gemini-3.1-flash-lite`, `gemini-flash-lite-latest`; or a comma-separated list of model ids. Backoff only starts after every model in the pool has failed |
+| `GEMINI_POOL` | unset | Failover pool. On 429/503 the request moves to the next model immediately instead of waiting on the same one. `cheap` = `gemini-3.5-flash-lite`, `gemini-3.1-flash-lite`; or a comma-separated list of model ids. Backoff only starts after every model in the pool has failed |
 | `HOST` / `PORT` | `0.0.0.0` / `8000` | Bind address |
 | `RETRY_MAX_SECONDS` | `900` | How long to keep retrying transient upstream failures before returning the error |
 | `RETRY_EMPTY` | `3` | Retries when Gemini returns an empty reply |
@@ -77,6 +77,21 @@ GEMINI_API_KEY=your_key python opengem.py
 Transient Gemini failures (503 high demand, 429, other 5xx, network errors, empty replies) are retried with backoff (1s growing to 20s) instead of being passed to the client, so multi-step agents don't lose progress. Streaming responses send SSE keepalive comments while waiting; non-streaming requests simply take longer, so set generous client timeouts. Retries only happen before any output is forwarded, so nothing is duplicated. Blocked (safety) and length-limited replies are not retried. Retry attempts are logged (`docker logs`).
 
 With `GEMINI_POOL` set, a 429/503 first switches to the next model in the pool (logged as `failing over to ...`); only when all of them have failed does it back off and retry. The `model` field in replies still shows the model the client asked for; the log shows which one actually answered the retry.
+
+### Wide failover pool (flash-lite, then flash)
+
+Cheapest first, so the pricier models only see traffic when the cheaper ones are rate limited:
+
+```bash
+docker run -d --name opengem --restart unless-stopped --pull always \
+  -e GEMINI_API_KEY=your_key \
+  -e GEMINI_MODEL=gemini-3.5-flash-lite \
+  -e GEMINI_POOL=gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemini-3-flash-preview,gemini-3.6-flash,gemini-3.8-flash \
+  -p 8000:8000 \
+  ghcr.io/kolosp/opengem:latest
+```
+
+Aliases such as `gemini-flash-lite-latest` (currently 3.5 flash-lite), `gemini-flash-latest` (3.8 flash) and `gemini-3.5-flash` (served by 3.6 flash) are left out because they hit the same model as another entry. See [MODELS.md](MODELS.md) for the full list.
 
 ## Limitations
 
