@@ -6,6 +6,7 @@ Function calling is supported on chat completions and responses.
 Env:
   GEMINI_API_KEY   required
   GEMINI_MODEL     default model if the client sends none (default gemini-3.5-flash-lite)
+  GEMINI_FORCE_MODEL  1 = always use GEMINI_MODEL, ignoring the client's model
   HOST / PORT      bind address (default 0.0.0.0:8000)
 """
 import asyncio
@@ -24,6 +25,8 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 API_KEY = os.environ.get("GEMINI_API_KEY", "")
 DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
+# When set, always use DEFAULT_MODEL and ignore the model the client asks for.
+FORCE_MODEL = os.environ.get("GEMINI_FORCE_MODEL", "").lower() in ("1", "true", "yes", "on")
 BASE = "https://generativelanguage.googleapis.com/v1beta"
 # Transient upstream failures (503 high demand, 429, 5xx, network errors, empty replies) are retried
 # with backoff so multi-step agents don't lose progress. Give up after RETRY_MAX_SECONDS.
@@ -290,8 +293,16 @@ async def stream(model: str, req: dict, chat: bool) -> AsyncIterator[str]:
     yield "data: [DONE]\n\n"
 
 
+def pick_model(body: dict) -> str:
+    asked = (body.get("model") or "").removeprefix("models/")
+    model = DEFAULT_MODEL if FORCE_MODEL or not asked else asked
+    note = " (forced)" if FORCE_MODEL and asked and asked != model else ""
+    print(f"[opengem] model: client asked {asked or '-'}, using {model}{note}", flush=True)
+    return model
+
+
 async def handle(body: dict, messages: list[dict], chat: bool):
-    model = (body.get("model") or DEFAULT_MODEL).removeprefix("models/")
+    model = pick_model(body)
     req = build_request(body, messages)
     if not req["contents"]:
         return error(400, "no usable message content", "invalid_request_error")
@@ -556,7 +567,7 @@ async def responses_stream(model: str, req: dict) -> AsyncIterator[str]:
 @app.post("/v1/responses")
 async def responses(request: Request):
     body = await request.json()
-    model = (body.get("model") or DEFAULT_MODEL).removeprefix("models/")
+    model = pick_model(body)
     req = build_request({**body, "max_tokens": body.get("max_output_tokens")}, responses_messages(body))
     if not req["contents"]:
         return error(400, "no usable input", "invalid_request_error")

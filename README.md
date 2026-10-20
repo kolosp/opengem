@@ -33,6 +33,7 @@ services:
     environment:
       GEMINI_API_KEY: ${GEMINI_API_KEY}
       # GEMINI_MODEL: gemini-3.5-flash-lite   # default model when the client sends none
+      # GEMINI_FORCE_MODEL: "1"               # always use GEMINI_MODEL, ignore the client's
     ports:
       - "8000:8000"
 ```
@@ -55,6 +56,7 @@ See [MODELS.md](MODELS.md) for the available model ids.
 |---|---|---|
 | `GEMINI_API_KEY` | required | Gemini API key |
 | `GEMINI_MODEL` | `gemini-3.5-flash-lite` | Model used when the request has none |
+| `GEMINI_FORCE_MODEL` | off | `1`/`true` = always use `GEMINI_MODEL`, ignoring the model the client sends |
 | `HOST` / `PORT` | `0.0.0.0` / `8000` | Bind address |
 | `RETRY_MAX_SECONDS` | `900` | How long to keep retrying transient upstream failures before returning the error |
 | `RETRY_EMPTY` | `3` | Retries when Gemini returns an empty reply |
@@ -72,4 +74,4 @@ Transient Gemini failures (503 high demand, 429, other 5xx, network errors, empt
 
 ## Limitations
 
-Function calling works on chat completions and responses (non-function tools such as web search are ignored, `previous_response_id` is not supported). No embeddings or logprobs. Anyone who can reach the port can spend your Gemini quota, so keep it on the LAN.
+Function calling works on chat completions and responses (non-function tools such as web search are ignored, `previous_response_id` is not supported). No embeddings or logprobs. Each request logs the model asked for and the one used (`docker logs`). Anyone who can reach the port can spend your Gemini quota, so keep it on the LAN.
