@@ -32,7 +32,7 @@ services:
     restart: unless-stopped
     environment:
       GEMINI_API_KEY: ${GEMINI_API_KEY}
-      # GEMINI_MODEL: gemini-2.5-flash   # default model when the client sends none
+      # GEMINI_MODEL: gemini-3.5-flash-lite   # default model when the client sends none
     ports:
       - "8000:8000"
 ```
@@ -42,17 +42,19 @@ services:
 ```bash
 curl http://<lan-ip>:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"gemini-2.5-flash","messages":[{"role":"user","content":"hi"}],"stream":true}'
+  -d '{"model":"gemini-3.5-flash-lite","messages":[{"role":"user","content":"hi"}],"stream":true}'
 ```
 
 In OpenAI clients set `base_url=http://<lan-ip>:8000/v1` and use any dummy API key.
+
+See [MODELS.md](MODELS.md) for the available model ids.
 
 ## Configuration
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `GEMINI_API_KEY` | required | Gemini API key |
-| `GEMINI_MODEL` | `gemini-2.5-flash` | Model used when the request has none |
+| `GEMINI_MODEL` | `gemini-3.5-flash-lite` | Model used when the request has none |
 | `HOST` / `PORT` | `0.0.0.0` / `8000` | Bind address |
 | `RETRY_MAX_SECONDS` | `900` | How long to keep retrying transient upstream failures before returning the error |
 | `RETRY_EMPTY` | `3` | Retries when Gemini returns an empty reply |

@@ -5,7 +5,7 @@ Function calling is supported on chat completions and responses.
 
 Env:
   GEMINI_API_KEY   required
-  GEMINI_MODEL     default model if the client sends none (default gemini-2.5-flash)
+  GEMINI_MODEL     default model if the client sends none (default gemini-3.5-flash-lite)
   HOST / PORT      bind address (default 0.0.0.0:8000)
 """
 import asyncio
@@ -23,7 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
 API_KEY = os.environ.get("GEMINI_API_KEY", "")
-DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
 BASE = "https://generativelanguage.googleapis.com/v1beta"
 # Transient upstream failures (503 high demand, 429, 5xx, network errors, empty replies) are retried
 # with backoff so multi-step agents don't lose progress. Give up after RETRY_MAX_SECONDS.
