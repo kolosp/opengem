@@ -17,6 +17,7 @@ from typing import Any, AsyncIterator
 import httpx
 import uvicorn
 from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
 API_KEY = os.environ.get("GEMINI_API_KEY", "")
@@ -24,6 +25,8 @@ DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 BASE = "https://generativelanguage.googleapis.com/v1beta"
 
 app = FastAPI(title="opengem")
+# Browser clients (e.g. a web UI on :3000) send a CORS preflight for the Authorization header.
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 client = httpx.AsyncClient(timeout=httpx.Timeout(300, connect=10))
 
 FINISH = {"STOP": "stop", "MAX_TOKENS": "length", "SAFETY": "content_filter",
@@ -210,6 +213,112 @@ async def completions(request: Request):
     if isinstance(prompt, list):
         prompt = "\n".join(map(str, prompt))
     return await handle(body, [{"role": "user", "content": prompt}], chat=False)
+
+
+# ---------- Responses API (/v1/responses) ----------
+
+def responses_messages(body: dict) -> list[dict]:
+    msgs = []
+    if body.get("instructions"):
+        msgs.append({"role": "system", "content": body["instructions"]})
+    inp = body.get("input", "")
+    if isinstance(inp, str):
+        return msgs + [{"role": "user", "content": inp}]
+    for item in inp:
+        if item.get("type", "message") != "message":
+            continue  # function_call / reasoning items etc. are not supported
+        c = item.get("content")
+        if isinstance(c, list):
+            parts = []
+            for p in c:
+                if p.get("type") in ("input_text", "output_text", "text"):
+                    parts.append({"type": "text", "text": p["text"]})
+                elif p.get("type") == "input_image":
+                    u = p.get("image_url")
+                    parts.append({"type": "image_url", "image_url": {"url": u["url"] if isinstance(u, dict) else u}})
+            c = parts
+        msgs.append({"role": item.get("role", "user"), "content": c})
+    return msgs
+
+
+def resp_obj(rid: str, model: str, created: int, status: str, text: str = "", u: dict | None = None,
+             mid: str = "") -> dict:
+    output = []
+    if status == "completed":
+        output = [{"type": "message", "id": mid, "status": "completed", "role": "assistant",
+                   "content": [{"type": "output_text", "text": text, "annotations": []}]}]
+    o: dict[str, Any] = {"id": rid, "object": "response", "created_at": created, "status": status,
+                         "model": model, "output": output}
+    if u:
+        o["usage"] = {"input_tokens": u["prompt_tokens"], "output_tokens": u["completion_tokens"],
+                      "total_tokens": u["total_tokens"]}
+    return o
+
+
+async def responses_stream(model: str, req: dict) -> AsyncIterator[str]:
+    rid, mid, created = f"resp_{uuid.uuid4().hex}", f"msg_{uuid.uuid4().hex}", int(time.time())
+    seq = 0
+
+    def ev(t: str, **kw) -> str:
+        nonlocal seq
+        seq += 1
+        return f"event: {t}\ndata: {json.dumps({'type': t, 'sequence_number': seq, **kw})}\n\n"
+
+    yield ev("response.created", response=resp_obj(rid, model, created, "in_progress"))
+    yield ev("response.in_progress", response=resp_obj(rid, model, created, "in_progress"))
+    yield ev("response.output_item.added", output_index=0,
+             item={"id": mid, "type": "message", "status": "in_progress", "role": "assistant", "content": []})
+    yield ev("response.content_part.added", item_id=mid, output_index=0, content_index=0,
+             part={"type": "output_text", "text": "", "annotations": []})
+    full, u = "", {}
+    async with client.stream("POST", f"{BASE}/models/{model}:streamGenerateContent?alt=sse",
+                             json=req, headers={"x-goog-api-key": API_KEY}) as r:
+        if r.status_code != 200:
+            msg = (await r.aread()).decode(errors="replace")
+            yield ev("error", code=str(r.status_code), message=msg, param=None)
+            return
+        async for line in r.aiter_lines():
+            if not line.startswith("data:"):
+                continue
+            d = json.loads(line[5:])
+            if "usageMetadata" in d:
+                u = usage(d)
+            for c in d.get("candidates", []):
+                t = cand_text(c)
+                if t:
+                    full += t
+                    yield ev("response.output_text.delta", item_id=mid, output_index=0,
+                             content_index=0, delta=t)
+    yield ev("response.output_text.done", item_id=mid, output_index=0, content_index=0, text=full)
+    yield ev("response.content_part.done", item_id=mid, output_index=0, content_index=0,
+             part={"type": "output_text", "text": full, "annotations": []})
+    done = resp_obj(rid, model, created, "completed", full, u, mid)
+    yield ev("response.output_item.done", output_index=0, item=done["output"][0])
+    yield ev("response.completed", response=done)
+
+
+@app.post("/v1/responses")
+async def responses(request: Request):
+    body = await request.json()
+    model = (body.get("model") or DEFAULT_MODEL).removeprefix("models/")
+    chat_body = {**body, "max_tokens": body.get("max_output_tokens")}
+    req = build_request(chat_body, responses_messages(body))
+    if not req["contents"]:
+        return error(400, "no usable input", "invalid_request_error")
+    if body.get("stream"):
+        return StreamingResponse(responses_stream(model, req), media_type="text/event-stream")
+    r = await client.post(f"{BASE}/models/{model}:generateContent", json=req,
+                          headers={"x-goog-api-key": API_KEY})
+    if r.status_code != 200:
+        try:
+            msg = r.json()["error"]["message"]
+        except Exception:
+            msg = r.text
+        return error(r.status_code, msg)
+    d = r.json()
+    text = "".join(cand_text(c) for c in d.get("candidates", [])[:1])
+    return JSONResponse(resp_obj(f"resp_{uuid.uuid4().hex}", model, int(time.time()), "completed",
+                                 text, usage(d), f"msg_{uuid.uuid4().hex}"))
 
 
 @app.get("/v1/models")

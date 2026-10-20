@@ -2,7 +2,7 @@
 
 OpenAI-compatible proxy for Google Gemini. **No auth, for private LAN use only.**
 
-Endpoints: `POST /v1/chat/completions`, `POST /v1/completions`, `GET /v1/models` (streaming supported).
+Endpoints: `POST /v1/chat/completions`, `POST /v1/completions`, `POST /v1/responses`, `GET /v1/models` (streaming supported, CORS open for browser clients).
 
 ## Run the ghcr image
 
